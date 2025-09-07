@@ -1,3 +1,5 @@
+#### This is just first experimental research. Each experiment ran just for 1.6 minutes. It should be more.
+
 ## Routing Noise in Small-Scale MoE: Step-by-Step Tutorial and Findings
 
 ### 1) Overview
