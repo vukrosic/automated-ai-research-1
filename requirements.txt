@@ -2,3 +2,6 @@ datasets
 transformers
 torchtune
 torchao
+google-genai
+openai
+python-dotenv
