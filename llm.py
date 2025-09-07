@@ -841,7 +841,7 @@ if __name__ == "__main__":
         n_layers=6,
         d_ff=1536,
         batch_size=24,
-        max_steps=3000,
+        max_steps=400,
         eval_every=500,  # Every 500 steps as per research plan
         vocab_size=vocab_size,
 
