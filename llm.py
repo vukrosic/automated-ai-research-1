@@ -874,8 +874,8 @@ if __name__ == "__main__":
     import csv
     results_file = "moe_routing_noise_experiment_results.csv"
     with open(results_file, 'w', newline='') as csvfile:
-    fieldnames = ['seed', 'noise_std', 'load_balancing_weight', 'val_loss', 'val_accuracy',
-                 'val_perplexity', 'training_time_minutes', 'peak_memory_gb', 'best_val_perplexity', 'expert_usage_cv']
+        fieldnames = ['seed', 'noise_std', 'load_balancing_weight', 'val_loss', 'val_accuracy',
+                     'val_perplexity', 'training_time_minutes', 'peak_memory_gb', 'best_val_perplexity', 'expert_usage_cv']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(all_results)

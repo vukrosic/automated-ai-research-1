@@ -166,7 +166,7 @@ class SimpleLLM:
                 self.variables[var_name] = result
 
                 # Save to file
-                filename = f"step{i}_{step['title'].lower().replace(' ', '_')}.txt"
+                filename = f"step{i}_{step['title'].lower().replace(' ', '_')}.md"
                 Path(filename).write_text(result)
                 print(f"💾 Saved to: {filename}")
 
