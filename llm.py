@@ -860,7 +860,15 @@ if __name__ == "__main__":
         for lb_weight in load_balancing_weights:
             for seed in seeds:
                 # Create config for this experiment
-                config_dict = base_config.__dict__.copy()
+                # Only copy the actual initialization parameters, not computed properties
+                init_params = [
+                    'd_model', 'n_heads', 'n_layers', 'd_ff', 'batch_size', 'max_steps',
+                    'gradient_accumulation_steps', 'muon_lr', 'max_seq_len', 'num_documents',
+                    'max_tokens', 'eval_every', 'eval_steps', 'weight_decay', 'dropout',
+                    'grad_clip', 'use_amp', 'vocab_size', 'log_milestones', 'num_experts',
+                    'expert_top_k', 'load_balancing_weight', 'noise_std'
+                ]
+                config_dict = {param: getattr(base_config, param) for param in init_params}
                 config_dict['noise_std'] = noise_std
                 config_dict['load_balancing_weight'] = lb_weight
                 config = MoEModelConfig(**config_dict)
