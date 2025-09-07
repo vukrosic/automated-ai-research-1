@@ -860,11 +860,10 @@ if __name__ == "__main__":
         for lb_weight in load_balancing_weights:
             for seed in seeds:
                 # Create config for this experiment
-                config = MoEModelConfig(
-                    **base_config.__dict__,
-                    noise_std=noise_std,
-                    load_balancing_weight=lb_weight
-                )
+                config_dict = base_config.__dict__.copy()
+                config_dict['noise_std'] = noise_std
+                config_dict['load_balancing_weight'] = lb_weight
+                config = MoEModelConfig(**config_dict)
 
                 # Run experiment
                 result = run_single_experiment(config, seed, None, None)  # Data loaders created inside
