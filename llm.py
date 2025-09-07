@@ -616,11 +616,12 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
                 loss.backward()
 
             # Optimizer step
+            grad_norm = None
             if (step + 1) % config.gradient_accumulation_steps == 0:
                 if config.use_amp:
                     for optimizer in optimizers:
                         scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
 
                     for optimizer in optimizers:
                         scaler.step(optimizer)
@@ -629,7 +630,7 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
                         scheduler.step()
                     scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
                     for optimizer in optimizers:
                         optimizer.step()
                         optimizer.zero_grad()
@@ -644,12 +645,16 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
                     current_loss = ce_loss.item()
                     perplexity = math.exp(min(current_loss, 20))
 
-                pbar.set_postfix({
+                postfix_dict = {
                     'loss': f'{current_loss:.4f}',
                     'aux': f'{aux_loss.item() if aux_loss is not None else 0:.4f}',
                     'acc': f'{accuracy:.3f}',
                     'ppl': f'{perplexity:.1f}'
-                })
+                }
+                if grad_norm is not None:
+                    postfix_dict['grad_norm'] = f'{grad_norm:.3f}'
+                
+                pbar.set_postfix(postfix_dict)
 
             # Evaluation
             if step % config.eval_every == 0 and step > 0:
