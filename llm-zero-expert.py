@@ -63,7 +63,10 @@ class MoEModelConfig:
 
     # MoE specific parameters
     num_experts: int = 8
+    num_zero_experts: int = 4  # Number of zero-computation experts
     expert_top_k: int = 2
+    expected_ffn_experts: float = 1.5  # Average FFN experts to activate (Ke in paper)
+    bias_adaptation_rate: float = 0.01  # μ in the paper
     load_balancing_weight: float = 0.01
 
     def __post_init__(self):
@@ -245,36 +248,47 @@ class Expert(nn.Module):
     def forward(self, x):
         return self.linear2(self.dropout(F.silu(self.linear1(x))))
 
+class ZeroComputationExpert(nn.Module):
+    """Zero-computation expert that returns input unchanged"""
+    def __init__(self):
+        super().__init__()
+        # No parameters needed - this is just an identity function
+
+    def forward(self, x):
+        return x  # Simply return input unchanged
+
 class TopKRouter(nn.Module):
-    """Router that selects top-k experts for each token"""
-    def __init__(self, d_model: int, num_experts: int, top_k: int = 2):
+    """Router that selects top-k experts with adaptive bias for zero-computation experts"""
+    def __init__(self, d_model: int, num_experts: int, num_zero_experts: int, top_k: int = 2):
         super().__init__()
         self.num_experts = num_experts
+        self.num_zero_experts = num_zero_experts
+        self.total_experts = num_experts + num_zero_experts
         self.top_k = top_k
-        self.gate = nn.Linear(d_model, num_experts, bias=False)
-        self.noise_std = 0.1  # Standard deviation for noise during training
+
+        # Gate projects to all experts (regular + zero-computation)
+        self.gate = nn.Linear(d_model, self.total_experts, bias=False)
+        self.noise_std = 0.1
+
+        # Initialize expert bias (learnable but updated via PID controller)
+        # Only FFN experts have bias, zero-computation experts have 0 bias
+        self.register_buffer('expert_bias', torch.zeros(self.total_experts))
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: Input tensor [batch_size, seq_len, d_model]
-
-        Returns:
-            - router_weights: Softmax weights for selected experts [batch_size, seq_len, top_k]
-            - expert_indices: Indices of selected experts [batch_size, seq_len, top_k]
-            - router_probs: Full probability distribution over experts (for load balancing loss)
-        """
         batch_size, seq_len, d_model = x.shape
 
         # Compute router logits
-        router_logits = self.gate(x)  # [batch_size, seq_len, num_experts]
+        router_logits = self.gate(x)  # [batch_size, seq_len, total_experts]
 
-        # Add noise during training for exploration
+        # Add expert bias (only for FFN experts, zero for zero-computation experts)
+        router_logits = router_logits + self.expert_bias.unsqueeze(0).unsqueeze(0)
+
+        # Add noise during training
         if self.training and self.noise_std > 0:
             noise = torch.randn_like(router_logits) * self.noise_std
             router_logits = router_logits + noise
 
-        # Get full probability distribution (for load balancing loss)
+        # Get full probability distribution
         router_probs = F.softmax(router_logits, dim=-1)
 
         # Select top-k experts
@@ -284,97 +298,141 @@ class TopKRouter(nn.Module):
         return top_k_weights, top_k_indices, router_probs
 
 class MixtureOfExperts(nn.Module):
-    """Mixture of Experts layer with top-k routing"""
+    """Mixture of Experts with zero-computation experts"""
     def __init__(
         self,
         d_model: int,
         d_ff: int,
         num_experts: int = 8,
+        num_zero_experts: int = 4,
         top_k: int = 2,
+        expected_ffn_experts: float = 1.5,
+        bias_adaptation_rate: float = 0.01,
         dropout: float = 0.1,
         load_balancing_weight: float = 0.01
     ):
         super().__init__()
         self.num_experts = num_experts
+        self.num_zero_experts = num_zero_experts
+        self.total_experts = num_experts + num_zero_experts
         self.top_k = top_k
+        self.expected_ffn_experts = expected_ffn_experts
+        self.bias_adaptation_rate = bias_adaptation_rate
         self.load_balancing_weight = load_balancing_weight
 
-        # Create experts
-        self.experts = nn.ModuleList([
+        # Create FFN experts
+        self.ffn_experts = nn.ModuleList([
             Expert(d_model, d_ff, dropout) for _ in range(num_experts)
         ])
 
-        # Create router
-        self.router = TopKRouter(d_model, num_experts, top_k)
+        # Create zero-computation experts (just placeholders, no parameters)
+        self.zero_experts = nn.ModuleList([
+            ZeroComputationExpert() for _ in range(num_zero_experts)
+        ])
+
+        # Combined expert list for easier indexing
+        self.all_experts = self.ffn_experts + self.zero_experts
+
+        # Create router with bias support
+        self.router = TopKRouter(d_model, num_experts, num_zero_experts, top_k)
+
+        # Track expert usage for bias updates
+        self.register_buffer('expert_usage', torch.zeros(self.total_experts))
+        self.register_buffer('total_tokens', torch.tensor(0.0))
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Args:
-            x: Input tensor [batch_size, seq_len, d_model]
-
-        Returns:
-            - output: MoE output [batch_size, seq_len, d_model]
-            - aux_loss: Load balancing auxiliary loss (only during training)
-        """
         batch_size, seq_len, d_model = x.shape
 
         # Get routing decisions
         router_weights, expert_indices, router_probs = self.router(x)
 
+        # Track expert usage for bias updates
+        if self.training:
+            with torch.no_grad():
+                # Count tokens routed to each expert
+                expert_mask = F.one_hot(expert_indices, num_classes=self.total_experts).float()
+                tokens_per_expert = expert_mask.sum(dim=[0, 1])  # Sum over batch and seq_len
+                self.expert_usage += tokens_per_expert.sum(dim=0)  # Sum over top_k
+                self.total_tokens += batch_size * seq_len
+
         # Initialize output tensor
         output = torch.zeros_like(x)
 
         # Process each expert
-        for expert_idx in range(self.num_experts):
+        for expert_idx in range(self.total_experts):
             # Find tokens routed to this expert
-            expert_mask = (expert_indices == expert_idx).any(dim=-1)  # [batch_size, seq_len]
+            expert_mask = (expert_indices == expert_idx).any(dim=-1)
 
             if expert_mask.any():
                 # Get tokens for this expert
-                expert_input = x[expert_mask]  # [num_tokens, d_model]
+                expert_input = x[expert_mask]
 
-                # Apply expert
-                expert_output = self.experts[expert_idx](expert_input)
+                # Apply appropriate expert (FFN or zero-computation)
+                if expert_idx < self.num_experts:
+                    # Regular FFN expert
+                    expert_output = self.ffn_experts[expert_idx](expert_input)
+                else:
+                    # Zero-computation expert (identity)
+                    expert_output = self.zero_experts[expert_idx - self.num_experts](expert_input)
 
-                # Get weights for this expert - CORRECTED APPROACH
-                # First get the mask for this expert's positions
-                mask_for_expert = (expert_indices == expert_idx)  # [batch, seq, top_k]
-                # Find which position (0 or 1) this expert appears in for relevant tokens
+                # Get weights for this expert
+                mask_for_expert = (expert_indices == expert_idx)
                 positions = mask_for_expert[expert_mask].float().argmax(dim=-1)
-                # Gather weights only for relevant tokens
                 expert_weights = router_weights[expert_mask].gather(
                     -1, positions.unsqueeze(-1)
                 ).squeeze(-1)
 
-                # Add weighted expert output to result
+                # Add weighted expert output
                 output[expert_mask] += expert_weights.unsqueeze(-1) * expert_output
 
-        # Compute load balancing loss during training
+        # Update expert bias based on usage (PID controller)
+        if self.training and self.total_tokens > 0:
+            self._update_expert_bias()
+
+        # Compute auxiliary loss
         aux_loss = None
         if self.training:
             aux_loss = self._compute_load_balancing_loss(router_probs, expert_indices)
 
         return output, aux_loss
 
+    def _update_expert_bias(self):
+        """Update expert bias using PID controller from Equation 2"""
+        with torch.no_grad():
+            # Calculate actual usage proportions
+            usage_proportions = self.expert_usage / (self.total_tokens * self.top_k + 1e-6)
+
+            # Expected proportion for each FFN expert
+            expected_ffn_proportion = self.expected_ffn_experts / (self.top_k * self.num_experts)
+
+            # Update bias only for FFN experts (not zero-computation experts)
+            for i in range(self.num_experts):
+                # Calculate bias increment using PID controller
+                actual_proportion = usage_proportions[i]
+                target_proportion = expected_ffn_proportion
+
+                # Equation 2 from paper
+                delta_bi = self.bias_adaptation_rate * (target_proportion - actual_proportion)
+                self.router.expert_bias[i] += delta_bi
+
+            # Zero-computation experts don't get bias updates (remain at 0)
+            # This is handled by initialization
+
+            # Reset usage tracking periodically
+            if self.total_tokens > 10000:  # Reset every 10k tokens
+                self.expert_usage.zero_()
+                self.total_tokens.zero_()
+
     def _compute_load_balancing_loss(
         self,
         router_probs: torch.Tensor,
         expert_indices: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Compute auxiliary loss to ensure balanced expert usage.
-        This encourages the router to distribute tokens evenly across experts.
-        """
-        # Compute the fraction of tokens routed to each expert
-        expert_mask = F.one_hot(expert_indices, num_classes=self.num_experts).float()
+        """Load balancing loss for all experts (including zero-computation)"""
+        expert_mask = F.one_hot(expert_indices, num_classes=self.total_experts).float()
         tokens_per_expert = expert_mask.sum(dim=[0, 1, 2]) / expert_mask.sum()
-
-        # Compute the average probability of routing to each expert
         router_prob_mean = router_probs.mean(dim=[0, 1])
-
-        # Load balancing loss encourages uniform distribution
-        aux_loss = torch.sum(tokens_per_expert * router_prob_mean) * self.num_experts
-
+        aux_loss = torch.sum(tokens_per_expert * router_prob_mean) * self.total_experts
         return aux_loss * self.load_balancing_weight
 
 class MoETransformerBlock(nn.Module):
@@ -386,7 +444,10 @@ class MoETransformerBlock(nn.Module):
         d_ff: int,
         max_seq_len: int,
         num_experts: int = 8,
+        num_zero_experts: int = 4,
         top_k: int = 2,
+        expected_ffn_experts: float = 1.5,
+        bias_adaptation_rate: float = 0.01,
         dropout: float = 0.1
     ):
         super().__init__()
@@ -394,9 +455,10 @@ class MoETransformerBlock(nn.Module):
         # Attention layer
         self.attention = MultiHeadAttention(d_model, n_heads, max_seq_len, dropout)
 
-        # MoE layer
+        # MoE layer with zero-computation experts
         self.feed_forward = MixtureOfExperts(
-            d_model, d_ff, num_experts, top_k, dropout
+            d_model, d_ff, num_experts, num_zero_experts, top_k,
+            expected_ffn_experts, bias_adaptation_rate, dropout
         )
 
         # Normalization layers
@@ -433,7 +495,10 @@ class MoEMinimalLLM(nn.Module):
                 config.d_ff,
                 config.max_seq_len,
                 config.num_experts,
+                config.num_zero_experts,
                 config.expert_top_k,
+                config.expected_ffn_experts,
+                config.bias_adaptation_rate,
                 config.dropout
             )
             for i in range(config.n_layers)
@@ -541,7 +606,7 @@ def setup_muon_optimizer(model: nn.Module, config: MoEModelConfig):
 
 def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader: DataLoader):
     """Train the MoE model"""
-    print(f"\n🚀 Training MoE model with {config.num_experts} experts (top-{config.expert_top_k})")
+    print(f"\n🚀 Training MoE model with {config.num_experts} FFN + {config.num_zero_experts} zero experts (top-{config.expert_top_k})")
 
     # Initialize model
     set_seed(42)
@@ -551,13 +616,14 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
-    active_params = sum(p.numel() for n, p in model.named_parameters()
-                       if 'expert' not in n)
-    expert_params = total_params - active_params
+    ffn_expert_params = sum(p.numel() for n, p in model.named_parameters()
+                           if 'ffn_experts' in n)
+    active_params = total_params - ffn_expert_params
 
     print(f"  📊 Total parameters: {total_params:,}")
-    print(f"  📊 Active parameters: {active_params:,}")
-    print(f"  📊 Expert parameters: {expert_params:,}")
+    print(f"  📊 Active parameters: {active_params:,} ({active_params/total_params:.1f}% active)")
+    print(f"  📊 FFN expert parameters: {ffn_expert_params:,}")
+    print(f"  📊 Zero experts: {config.num_zero_experts} (0 parameters)")
     print(f"  📊 Parameter efficiency: {active_params/total_params:.1%} active per forward pass")
 
     # Setup optimizers
@@ -706,8 +772,11 @@ if __name__ == "__main__":
         vocab_size=vocab_size,
 
         # MoE specific
-        num_experts=8,
-        expert_top_k=2,
+        num_experts=6,  # Reduce FFN experts since we're adding zero experts
+        num_zero_experts=4,  # Add 4 zero-computation experts
+        expert_top_k=2,  # Select top-2 experts per token
+        expected_ffn_experts=1.2,  # On average, use 1.2 FFN experts (0.8 zero experts)
+        bias_adaptation_rate=0.01,  # Learning rate for bias updates
         load_balancing_weight=0.01
     )
 
@@ -732,7 +801,7 @@ if __name__ == "__main__":
 
     print(f"\n📋 MoE Model Configuration:")
     print(f"   Architecture: {config.d_model}d, {config.n_layers}L, {config.n_heads}H, {config.d_ff}ff")
-    print(f"   MoE: {config.num_experts} experts, top-{config.expert_top_k} routing")
+    print(f"   MoE: {config.num_experts} FFN + {config.num_zero_experts} zero experts, top-{config.expert_top_k} routing")
     print(f"   Training: {config.max_steps} steps, batch size {config.batch_size}")
     print(f"   Data: {config.max_tokens:,} tokens, seq_len {config.max_seq_len}")
 
