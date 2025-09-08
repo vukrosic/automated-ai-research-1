@@ -179,7 +179,10 @@ class SimpleLLM:
 
 def main():
     """Command line interface."""
-    if len(sys.argv) < 3:
+    if len(sys.argv) == 1:
+        # Auto-run chain with default files
+        command = "auto_chain"
+    elif len(sys.argv) < 3:
         print("Usage:")
         print("  python simple_llm.py <model> <prompt>")
         print("  python simple_llm.py chain <markdown_file.md>")
@@ -189,8 +192,8 @@ def main():
         print("  python simple_llm.py kimi 'Create a function'")
         print("  python simple_llm.py chain prompt.md")
         sys.exit(1)
-
-    command = sys.argv[1]
+    else:
+        command = sys.argv[1]
 
     if command in ["gemini", "kimi"]:
         # Direct model call
@@ -206,14 +209,16 @@ def main():
             print(f"❌ Error: {e}")
             sys.exit(1)
 
-    elif command == "chain":
+    elif command in ["chain", "auto_chain"]:
         # Run research methodology chain with markdown file
-        if len(sys.argv) < 3:
-            print("❌ Please provide a markdown file path")
-            print("Example: python simple_llm.py chain research_prompt.md")
-            sys.exit(1)
-
-        file_path = sys.argv[2]
+        if command == "chain":
+            if len(sys.argv) < 3:
+                print("❌ Please provide a markdown file path")
+                print("Example: python simple_llm.py chain research_prompt.md")
+                sys.exit(1)
+            file_path = sys.argv[2]
+        else:  # auto_chain
+            file_path = "research_prompt.md"
 
         try:
             llm = SimpleLLM()
