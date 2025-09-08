@@ -65,6 +65,8 @@ class MoEModelConfig:
     num_experts: int = 8
     expert_top_k: int = 2
     load_balancing_weight: float = 0.01
+    z_loss_weight: float = 0.0  # Weight for z-loss (logit magnitude regularization)
+    noise_std: float = 0.1  # Standard deviation for router noise during training
 
     def __post_init__(self):
         self.d_k = self.d_model // self.n_heads
@@ -247,14 +249,14 @@ class Expert(nn.Module):
 
 class TopKRouter(nn.Module):
     """Router that selects top-k experts for each token"""
-    def __init__(self, d_model: int, num_experts: int, top_k: int = 2):
+    def __init__(self, d_model: int, num_experts: int, top_k: int = 2, noise_std: float = 0.1):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
         self.gate = nn.Linear(d_model, num_experts, bias=False)
-        self.noise_std = 0.1  # Standard deviation for noise during training
+        self.noise_std = noise_std  # Standard deviation for noise during training
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             x: Input tensor [batch_size, seq_len, d_model]
@@ -263,6 +265,7 @@ class TopKRouter(nn.Module):
             - router_weights: Softmax weights for selected experts [batch_size, seq_len, top_k]
             - expert_indices: Indices of selected experts [batch_size, seq_len, top_k]
             - router_probs: Full probability distribution over experts (for load balancing loss)
+            - router_logits: Raw router logits [batch_size, seq_len, num_experts] (for z-loss)
         """
         batch_size, seq_len, d_model = x.shape
 
@@ -281,7 +284,7 @@ class TopKRouter(nn.Module):
         top_k_logits, top_k_indices = torch.topk(router_logits, self.top_k, dim=-1)
         top_k_weights = F.softmax(top_k_logits, dim=-1)
 
-        return top_k_weights, top_k_indices, router_probs
+        return top_k_weights, top_k_indices, router_probs, router_logits
 
 class MixtureOfExperts(nn.Module):
     """Mixture of Experts layer with top-k routing"""
@@ -292,7 +295,8 @@ class MixtureOfExperts(nn.Module):
         num_experts: int = 8,
         top_k: int = 2,
         dropout: float = 0.1,
-        load_balancing_weight: float = 0.01
+        load_balancing_weight: float = 0.01,
+        noise_std: float = 0.1
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -305,9 +309,9 @@ class MixtureOfExperts(nn.Module):
         ])
 
         # Create router
-        self.router = TopKRouter(d_model, num_experts, top_k)
+        self.router = TopKRouter(d_model, num_experts, top_k, noise_std)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """
         Args:
             x: Input tensor [batch_size, seq_len, d_model]
@@ -315,11 +319,12 @@ class MixtureOfExperts(nn.Module):
         Returns:
             - output: MoE output [batch_size, seq_len, d_model]
             - aux_loss: Load balancing auxiliary loss (only during training)
+            - router_logits: Raw router logits [batch_size, seq_len, num_experts] (for z-loss)
         """
         batch_size, seq_len, d_model = x.shape
 
         # Get routing decisions
-        router_weights, expert_indices, router_probs = self.router(x)
+        router_weights, expert_indices, router_probs, router_logits = self.router(x)
 
         # Initialize output tensor
         output = torch.zeros_like(x)
@@ -354,7 +359,7 @@ class MixtureOfExperts(nn.Module):
         if self.training:
             aux_loss = self._compute_load_balancing_loss(router_probs, expert_indices)
 
-        return output, aux_loss
+        return output, aux_loss, router_logits
 
     def _compute_load_balancing_loss(
         self,
@@ -387,7 +392,8 @@ class MoETransformerBlock(nn.Module):
         max_seq_len: int,
         num_experts: int = 8,
         top_k: int = 2,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        noise_std: float = 0.1
     ):
         super().__init__()
 
@@ -396,7 +402,7 @@ class MoETransformerBlock(nn.Module):
 
         # MoE layer
         self.feed_forward = MixtureOfExperts(
-            d_model, d_ff, num_experts, top_k, dropout
+            d_model, d_ff, num_experts, top_k, dropout, noise_std=noise_std
         )
 
         # Normalization layers
@@ -410,9 +416,9 @@ class MoETransformerBlock(nn.Module):
         x = x + self.dropout(attn_out)
 
         # MoE feed-forward
-        ff_out, aux_loss = self.feed_forward(self.norm2(x))
+        ff_out, aux_loss, router_logits = self.feed_forward(self.norm2(x))
         x = x + self.dropout(ff_out)
-        return x, aux_loss
+        return x, aux_loss, router_logits
 
 
 class MoEMinimalLLM(nn.Module):
@@ -434,7 +440,8 @@ class MoEMinimalLLM(nn.Module):
                 config.max_seq_len,
                 config.num_experts,
                 config.expert_top_k,
-                config.dropout
+                config.dropout,
+                config.noise_std
             )
             for i in range(config.n_layers)
         ])
@@ -457,19 +464,22 @@ class MoEMinimalLLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, x, return_aux_loss=True):
+    def forward(self, x, return_aux_loss=True, return_router_logits=False):
         # Token embeddings
         x = self.token_embedding(x) * math.sqrt(self.config.d_model)
         x = self.position_dropout(x)
 
-        # Collect auxiliary losses from MoE layers
+        # Collect auxiliary losses and router logits from MoE layers
         aux_losses = []
+        all_router_logits = []
 
         # Pass through transformer blocks
         for block in self.transformer_blocks:
-            x, aux_loss = block(x)
+            x, aux_loss, router_logits = block(x)
             if aux_loss is not None and return_aux_loss:
                 aux_losses.append(aux_loss)
+            if return_router_logits:
+                all_router_logits.append(router_logits)
 
         # Output projection
         x = self.norm(x)
@@ -479,9 +489,15 @@ class MoEMinimalLLM(nn.Module):
         # Combine auxiliary losses
         total_aux_loss = sum(aux_losses) if aux_losses else None
 
-        if return_aux_loss:
+        # Return appropriate values
+        if return_aux_loss and return_router_logits:
+            return logits, total_aux_loss, all_router_logits
+        elif return_aux_loss:
             return logits, total_aux_loss
-        return logits
+        elif return_router_logits:
+            return logits, all_router_logits
+        else:
+            return logits
 
 def evaluate_model(model: nn.Module, val_loader: DataLoader, config: MoEModelConfig):
     """Evaluate model performance"""
@@ -489,6 +505,8 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: MoEModelCon
     total_loss = 0
     total_tokens = 0
     total_correct = 0
+    total_router_entropy = 0
+    entropy_samples = 0
 
     device = next(model.parameters()).device
 
@@ -500,7 +518,12 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: MoEModelCon
 
             with autocast(enabled=config.use_amp):
                 # MoE model evaluation
-                logits = model(x, return_aux_loss=False)  # Don't return aux loss during eval
+                if config.z_loss_weight > 0:
+                    logits, all_router_logits = model(x, return_aux_loss=False, return_router_logits=True)
+                else:
+                    logits = model(x, return_aux_loss=False)
+                    all_router_logits = None
+
                 loss = F.cross_entropy(logits.view(-1, config.vocab_size), y.view(-1))
 
             total_loss += loss.item() * y.numel()
@@ -509,12 +532,30 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: MoEModelCon
             predictions = logits.argmax(dim=-1)
             total_correct += (predictions == y).sum().item()
 
+            # Calculate router entropy if z-loss is enabled
+            if config.z_loss_weight > 0 and all_router_logits is not None:
+                # Combine router logits from all layers (average across layers)
+                combined_router_logits = torch.stack(all_router_logits, dim=0).mean(dim=0)  # [batch, seq, num_experts]
+
+                # Router entropy: measures confidence of routing decisions
+                router_probs = torch.softmax(combined_router_logits, dim=-1)
+                batch_entropy = -torch.mean(torch.sum(router_probs * torch.log_softmax(combined_router_logits, dim=-1), dim=-1))
+                total_router_entropy += batch_entropy.item() * x.size(0) * x.size(1)  # weight by number of tokens
+                entropy_samples += x.size(0) * x.size(1)
+
     avg_loss = total_loss / total_tokens
     accuracy = total_correct / total_tokens
     perplexity = math.exp(min(avg_loss, 20))
 
+    result = {'val_loss': avg_loss, 'val_accuracy': accuracy, 'val_perplexity': perplexity}
+
+    # Add router entropy if calculated
+    if entropy_samples > 0:
+        avg_router_entropy = total_router_entropy / entropy_samples
+        result['router_entropy'] = avg_router_entropy
+
     model.train()
-    return {'val_loss': avg_loss, 'val_accuracy': accuracy, 'val_perplexity': perplexity}
+    return result
 
 def setup_muon_optimizer(model: nn.Module, config: MoEModelConfig):
     """Setup Muon optimizer with hybrid approach"""
@@ -582,9 +623,11 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
     # Training loop
     model.train()
     step = 0
+    step_times = []  # Track timing for ms/step calculation
     pbar = tqdm(total=config.max_steps, desc="Training MoE")
 
     while step < config.max_steps:
+        step_start_time = time.time()
         for batch_idx, (x, y) in enumerate(train_loader):
             if step >= config.max_steps:
                 break
@@ -594,21 +637,60 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
             # Forward pass
             if config.use_amp:
                 with autocast():
-                    logits, aux_loss = model(x, return_aux_loss=True)
+                    if config.z_loss_weight > 0:
+                        logits, aux_loss, all_router_logits = model(x, return_aux_loss=True, return_router_logits=True)
+                    else:
+                        logits, aux_loss = model(x, return_aux_loss=True)
+                        all_router_logits = None
+
                     ce_loss = F.cross_entropy(logits.view(-1, config.vocab_size), y.view(-1))
 
-                    # Combine main loss and auxiliary loss
-                    total_loss = ce_loss
+                    # Calculate z-loss if enabled
+                    z_loss = 0.0
+                    router_entropy = 0.0
+                    if config.z_loss_weight > 0 and all_router_logits is not None:
+                        # Combine router logits from all layers (average across layers)
+                        combined_router_logits = torch.stack(all_router_logits, dim=0).mean(dim=0)  # [batch, seq, num_experts]
+
+                        # Z-loss: penalizes large logit magnitudes (logsumexp squared)
+                        z_loss = config.z_loss_weight * torch.mean(torch.logsumexp(combined_router_logits, dim=-1)**2)
+
+                        # Router entropy: measures confidence of routing decisions
+                        router_probs = torch.softmax(combined_router_logits, dim=-1)
+                        router_entropy = -torch.mean(torch.sum(router_probs * torch.log_softmax(combined_router_logits, dim=-1), dim=-1))
+
+                    # Combine main loss, auxiliary loss, and z-loss
+                    total_loss = ce_loss + z_loss
                     if aux_loss is not None:
                         total_loss = total_loss + aux_loss
 
                     loss = total_loss / config.gradient_accumulation_steps
                 scaler.scale(loss).backward()
             else:
-                logits, aux_loss = model(x, return_aux_loss=True)
+                if config.z_loss_weight > 0:
+                    logits, aux_loss, all_router_logits = model(x, return_aux_loss=True, return_router_logits=True)
+                else:
+                    logits, aux_loss = model(x, return_aux_loss=True)
+                    all_router_logits = None
+
                 ce_loss = F.cross_entropy(logits.view(-1, config.vocab_size), y.view(-1))
 
-                total_loss = ce_loss
+                # Calculate z-loss if enabled
+                z_loss = 0.0
+                router_entropy = 0.0
+                if config.z_loss_weight > 0 and all_router_logits is not None:
+                    # Combine router logits from all layers (average across layers)
+                    combined_router_logits = torch.stack(all_router_logits, dim=0).mean(dim=0)  # [batch, seq, num_experts]
+
+                    # Z-loss: penalizes large logit magnitudes (logsumexp squared)
+                    z_loss = config.z_loss_weight * torch.mean(torch.logsumexp(combined_router_logits, dim=-1)**2)
+
+                    # Router entropy: measures confidence of routing decisions
+                    router_probs = torch.softmax(combined_router_logits, dim=-1)
+                    router_entropy = -torch.mean(torch.sum(router_probs * torch.log_softmax(combined_router_logits, dim=-1), dim=-1))
+
+                # Combine main loss, auxiliary loss, and z-loss
+                total_loss = ce_loss + z_loss
                 if aux_loss is not None:
                     total_loss = total_loss + aux_loss
 
@@ -644,19 +726,33 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
                     current_loss = ce_loss.item()
                     perplexity = math.exp(min(current_loss, 20))
 
-                pbar.set_postfix({
+                # Prepare logging info
+                log_info = {
                     'loss': f'{current_loss:.4f}',
                     'aux': f'{aux_loss.item() if aux_loss is not None else 0:.4f}',
                     'acc': f'{accuracy:.3f}',
                     'ppl': f'{perplexity:.1f}'
-                })
+                }
+
+                # Add z-loss and router entropy if enabled
+                if config.z_loss_weight > 0:
+                    log_info['z_loss'] = f'{z_loss.item():.4f}'
+                    log_info['entropy'] = f'{router_entropy.item():.3f}'
+
+                pbar.set_postfix(log_info)
 
             # Evaluation
             if step % config.eval_every == 0 and step > 0:
                 eval_metrics = evaluate_model(model, val_loader, config)
-                print(f"\nStep {step}: Val Loss: {eval_metrics['val_loss']:.4f}, "
-                      f"Val Acc: {eval_metrics['val_accuracy']:.4f}, "
-                      f"Val PPL: {eval_metrics['val_perplexity']:.2f}")
+                eval_str = (f"\nStep {step}: Val Loss: {eval_metrics['val_loss']:.4f}, "
+                           f"Val Acc: {eval_metrics['val_accuracy']:.4f}, "
+                           f"Val PPL: {eval_metrics['val_perplexity']:.2f}")
+
+                # Add router entropy if available
+                if 'router_entropy' in eval_metrics:
+                    eval_str += f", Router Entropy: {eval_metrics['router_entropy']:.3f}"
+
+                print(eval_str)
 
             # Milestone evaluations
             if step in getattr(config, 'log_milestones', ()):    
@@ -664,6 +760,15 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
                 print(f"\n🧪 Milestone {step}: Val Loss: {eval_metrics['val_loss']:.4f}")
 
             step += 1
+
+            # Track step timing
+            step_end_time = time.time()
+            step_times.append(step_end_time - step_start_time)
+
+            # Keep only last 100 steps for timing calculation
+            if len(step_times) > 100:
+                step_times.pop(0)
+
             if step % 100 == 0:
                 pbar.update(100)
 
@@ -671,80 +776,225 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
 
     # Final evaluation
     final_eval = evaluate_model(model, val_loader, config)
+
+    # Calculate average step time
+    avg_step_time = sum(step_times) / len(step_times) if step_times else 0
+    ms_per_step = avg_step_time * 1000
+
+    final_eval['ms_per_step'] = ms_per_step
+
     print(f"\n📊 Final Results:")
     print(f"   Val Loss: {final_eval['val_loss']:.4f}")
     print(f"   Val Accuracy: {final_eval['val_accuracy']:.4f}")
     print(f"   Val Perplexity: {final_eval['val_perplexity']:.2f}")
+    print(f"   ms/step: {ms_per_step:.2f}")
+
+    if 'router_entropy' in final_eval:
+        print(f"   Router Entropy: {final_eval['router_entropy']:.3f}")
 
     return model, final_eval
 
-if __name__ == "__main__":
-    # Check system
-    print(f"🔍 Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name()}")
-        print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-
-    # Set seed
-    set_seed(42)
-
-    # Load data first to get vocab_size
-    temp_config = MoEModelConfig()  # Use MoE config for data loading
-    texts, tokenizer, tokens = load_and_cache_data(temp_config)
-    vocab_size = temp_config.vocab_size
-
-    # Test MoE model
-    config = MoEModelConfig(
-        # Base model parameters
-        d_model=384,
-        n_heads=8,
-        n_layers=6,
-        d_ff=1536,
-        batch_size=24,
-        max_steps=1000,
-        eval_every=10000000,
-        vocab_size=vocab_size,
-
-        # MoE specific
-        num_experts=8,
-        expert_top_k=2,
-        load_balancing_weight=0.01
-    )
-
-    dataset = TextTokenDataset(tokens, temp_config.max_seq_len)
-
-    # Train/val split
-    val_size = len(dataset) // 10
-    train_size = len(dataset) - val_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
-    )
-
-    train_loader = DataLoader(train_dataset, batch_size=temp_config.batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=temp_config.batch_size, shuffle=False, num_workers=2)
-
-    print(f"📊 Dataset: {len(train_dataset)} train, {len(val_dataset)} val samples")
-
-    # Train MoE model
+def run_experiment(experiment_name: str, config: MoEModelConfig, train_loader: DataLoader, val_loader: DataLoader, test_loader: DataLoader):
+    """Run a single experiment and return results"""
     print(f"\n{'='*60}")
-    print(f"🧪 TRAINING: Mixture of Experts Model")
+    print(f"🧪 EXPERIMENT: {experiment_name}")
     print(f"{'='*60}")
 
-    print(f"\n📋 MoE Model Configuration:")
-    print(f"   Architecture: {config.d_model}d, {config.n_layers}L, {config.n_heads}H, {config.d_ff}ff")
-    print(f"   MoE: {config.num_experts} experts, top-{config.expert_top_k} routing")
-    print(f"   Training: {config.max_steps} steps, batch size {config.batch_size}")
-    print(f"   Data: {config.max_tokens:,} tokens, seq_len {config.max_seq_len}")
+    print("Configuration:")
+    print(f"   z_loss_weight: {config.z_loss_weight}")
+    print(f"   noise_std: {config.noise_std}")
+    print(f"   load_balancing_weight: {config.load_balancing_weight}")
 
     # Train model
     start_time = time.time()
     model, final_metrics = train_moe_model(config, train_loader, val_loader)
     total_time = time.time() - start_time
 
-    print(f"\n🎯 MoE Model Results:")
+    # Final evaluation on test set (unbiased)
+    test_metrics = evaluate_model(model, test_loader, config)
+
+    results = {
+        'experiment_name': experiment_name,
+        'config': {
+            'z_loss_weight': config.z_loss_weight,
+            'noise_std': config.noise_std,
+            'load_balancing_weight': config.load_balancing_weight
+        },
+        'training_time_minutes': total_time / 60,
+        'ms_per_step': final_metrics['ms_per_step'],
+        'val_perplexity': final_metrics['val_perplexity'],
+        'test_perplexity': test_metrics['val_perplexity'],  # unbiased test perplexity
+        'val_loss': final_metrics['val_loss'],
+        'test_loss': test_metrics['val_loss'],
+        'val_accuracy': final_metrics['val_accuracy'],
+        'test_accuracy': test_metrics['val_accuracy']
+    }
+
+    # Add router entropy if available
+    if 'router_entropy' in final_metrics:
+        results['val_router_entropy'] = final_metrics['router_entropy']
+    if 'router_entropy' in test_metrics:
+        results['test_router_entropy'] = test_metrics['router_entropy']
+
+    print(f"\n🎯 {experiment_name} Results:")
     print(f"⏱️ Training time: {total_time/60:.1f} minutes")
-    print(f"🏆 Final Results:")
-    print(f"   Validation Loss: {final_metrics['val_loss']:.4f}")
-    print(f"   Validation Accuracy: {final_metrics['val_accuracy']:.4f}")
-    print(f"   Validation Perplexity: {final_metrics['val_perplexity']:.2f}")
+    print(f"🏆 Val PPL: {results['val_perplexity']:.2f}")
+    print(f"🏆 Test PPL: {results['test_perplexity']:.2f}")
+    print(f"⚡ ms/step: {results['ms_per_step']:.2f}")
+
+    if 'val_router_entropy' in results:
+        print(f"🎲 Val Router Entropy: {results['val_router_entropy']:.3f}")
+    if 'test_router_entropy' in results:
+        print(f"🎲 Test Router Entropy: {results['test_router_entropy']:.3f}")
+
     print(f"{'='*60}")
+
+    return results
+
+if __name__ == "__main__":
+    print("🚀 MoE Z-Loss Research Experiments")
+    print("=" * 60)
+
+    # Check system
+    print(f"🔍 Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name()}")
+        print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+    # Set seed for reproducibility
+    set_seed(42)
+
+    # Load data first to get vocab_size
+    temp_config = MoEModelConfig()
+    texts, tokenizer, tokens = load_and_cache_data(temp_config)
+    vocab_size = temp_config.vocab_size
+
+    # Create dataset
+    dataset = TextTokenDataset(tokens, temp_config.max_seq_len)
+
+    # Train/val/test split (80%/10%/10% as per plan)
+    total_size = len(dataset)
+    val_size = total_size // 10  # 10% for validation
+    test_size = total_size // 10  # 10% for test (unbiased final evaluation)
+    train_size = total_size - val_size - test_size  # 80% for training
+
+    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size, test_size], generator=torch.Generator().manual_seed(42)
+    )
+
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=temp_config.batch_size, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=temp_config.batch_size, shuffle=False, num_workers=2)
+    test_loader = DataLoader(test_dataset, batch_size=temp_config.batch_size, shuffle=False, num_workers=2)
+
+    print("📊 Dataset Split:")
+    print(f"   Train: {len(train_dataset)} samples ({len(train_dataset)/total_size:.1%})")
+    print(f"   Val: {len(val_dataset)} samples ({len(val_dataset)/total_size:.1%})")
+    print(f"   Test: {len(test_dataset)} samples ({len(test_dataset)/total_size:.1%})")
+    print(f"   Total: {total_size} samples")
+
+    # Base configuration
+    base_config = MoEModelConfig(
+        # Base model parameters
+        d_model=384,
+        n_heads=8,
+        n_layers=6,
+        d_ff=1536,
+        batch_size=24,
+        max_steps=1000,  # Reduced for experiments
+        eval_every=500,  # Evaluate every 500 steps
+        vocab_size=vocab_size,
+
+        # MoE specific (will be overridden per experiment)
+        num_experts=8,
+        expert_top_k=2,
+        load_balancing_weight=0.01,
+        z_loss_weight=0.0,  # Default, overridden per experiment
+        noise_std=0.1  # Default, overridden per experiment
+    )
+
+    print("
+📋 Base Model Configuration:"    print(f"   Architecture: {base_config.d_model}d, {base_config.n_layers}L, {base_config.n_heads}H, {base_config.d_ff}ff")
+    print(f"   MoE: {base_config.num_experts} experts, top-{base_config.expert_top_k} routing")
+    print(f"   Training: {base_config.max_steps} steps, batch size {base_config.batch_size}")
+    print(f"   Data: {base_config.max_tokens:,} tokens, seq_len {base_config.max_seq_len}")
+
+    # Define experiments as per research plan
+    experiments = [
+        {
+            'name': 'Baseline MoE (Control)',
+            'config': base_config.__dict__ | {
+                'load_balancing_weight': 0.01,
+                'noise_std': 0.1,
+                'z_loss_weight': 0.0
+            }
+        },
+        {
+            'name': 'MoE with Z-Loss',
+            'config': base_config.__dict__ | {
+                'load_balancing_weight': 0.01,
+                'noise_std': 0.1,
+                'z_loss_weight': 0.001
+            }
+        },
+        {
+            'name': 'MoE with Z-Loss and No Routing Noise',
+            'config': base_config.__dict__ | {
+                'load_balancing_weight': 0.01,
+                'noise_std': 0.0,
+                'z_loss_weight': 0.001
+            }
+        },
+        {
+            'name': 'MoE with Higher Z-Loss Weight',
+            'config': base_config.__dict__ | {
+                'load_balancing_weight': 0.01,
+                'noise_std': 0.1,
+                'z_loss_weight': 0.01
+            }
+        }
+    ]
+
+    # Convert dict configs back to MoEModelConfig objects
+    for exp in experiments:
+        exp['config'] = MoEModelConfig(**exp['config'])
+
+    # Run all experiments
+    results = []
+    for exp in experiments:
+        exp_config = exp['config']
+        exp_config.max_steps = 1000  # Ensure all experiments run for 1000 steps
+
+        result = run_experiment(exp['name'], exp_config, train_loader, val_loader, test_loader)
+        results.append(result)
+
+    # Summary comparison
+    print("\n" + "="*80)
+    print("📊 EXPERIMENT SUMMARY COMPARISON")
+    print("="*80)
+
+    print("<10"    print("-" * 70)
+
+    for result in results:
+        config = result['config']
+        test_ppl = result['test_perplexity']
+        ms_step = result['ms_per_step']
+        overhead = "N/A"
+
+        if result['experiment_name'] == 'Baseline MoE (Control)':
+            baseline_ppl = test_ppl
+            baseline_ms = ms_step
+        else:
+            improvement = ((baseline_ppl - test_ppl) / baseline_ppl) * 100
+            overhead = ((ms_step - baseline_ms) / baseline_ms) * 100
+
+        print("<10")
+
+    print("\n🏆 Primary Success Metric: Test Perplexity (lower is better)")
+    print("⚡ Overhead: ms/step increase relative to baseline (lower is better)")
+
+    print("\n" + "="*80)
+    print("🎯 Research Conclusion:")
+    print("   Goal: Test if z-loss improves perplexity through more confident routing")
+    print("   Check test perplexity improvements and router entropy reductions above.")
+    print("="*80)
