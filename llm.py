@@ -913,8 +913,8 @@ if __name__ == "__main__":
         noise_std=0.1  # Default, overridden per experiment
     )
 
-    print("
-📋 Base Model Configuration:"    print(f"   Architecture: {base_config.d_model}d, {base_config.n_layers}L, {base_config.n_heads}H, {base_config.d_ff}ff")
+    print("\n📋 Base Model Configuration:")
+    print(f"   Architecture: {base_config.d_model}d, {base_config.n_layers}L, {base_config.n_heads}H, {base_config.d_ff}ff")
     print(f"   MoE: {base_config.num_experts} experts, top-{base_config.expert_top_k} routing")
     print(f"   Training: {base_config.max_steps} steps, batch size {base_config.batch_size}")
     print(f"   Data: {base_config.max_tokens:,} tokens, seq_len {base_config.max_seq_len}")
