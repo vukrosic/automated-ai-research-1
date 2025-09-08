@@ -245,7 +245,7 @@ def main():
                 {
                     "title": "Research_Plan",
                     "model": "gemini",
-                    "prompt": """SYSTEM CONSTRAINTS: {system_prompt}
+                    "prompt": """SYSTEM RULES: {system_prompt}
 
 Based on the existing MoE implementation in {code_content} and the research idea in {research_paper}, create a CONCISE research plan (max 800 words).
 
@@ -255,17 +255,16 @@ Focus on:
 - Experimental design (fair comparisons)
 - Success metrics
 - Timeline (keep it realistic and short - experiments should take 2-10 minutes on 1x4090)
+- No more than 1h in total of experiments
 
-IMPORTANT CONSTRAINTS:
+IMPORTANT RULES:
 - Do not change data source - only use SmolLM dataset
-- Do not make model bigger or train longer
-- Keep experiments fair and methodologically sound
-- Point out potential methodological issues in the existing code that could affect fairness"""
+- Keep experiments fair and methodologically sound"""
                 },
                 {
                     "title": "Critical_Review",
                     "model": "kimi",
-                    "prompt": """SYSTEM CONSTRAINTS: {system_prompt}
+                    "prompt": """SYSTEM RULES: {system_prompt}
 
 Review the research plan in {step1_result} for critical methodological flaws:
 
@@ -275,40 +274,40 @@ FOCUS ON:
 - Potential biases in evaluation
 - Missing controls
 - Overstated claims
-- Adherence to system constraints (SmolLM dataset, model size limits, training time limits)
+- Adherence to system rules (SmolLM dataset, model size limits, training time limits)
 
-SUGGEST SPECIFIC IMPROVEMENTS to make the research more rigorous and fair while respecting the system constraints. Be direct but constructive. Keep critique concise (max 600 words)."""
+SUGGEST SPECIFIC IMPROVEMENTS to make the research more rigorous and fair while respecting the system rules. Be direct but constructive. Keep critique concise (max 600 words)."""
                 },
                 {
                     "title": "Critique_Analysis",
                     "model": "gemini",
-                    "prompt": """SYSTEM CONSTRAINTS: {system_prompt}
+                    "prompt": """SYSTEM RULES: {system_prompt}
 
-Analyze the critique in {step2_result} and provide counter-arguments where appropriate:
+Analyze the {step1_result} and critique in {step2_result} and provide counter-arguments where appropriate:
 
 ADDRESS:
-- Are the criticisms valid given the system constraints?
+- Are the criticisms valid given the system rules?
 - Are there over-cautions that ignore practical limitations?
 - What aspects of the critique are most important?
-- What can be realistically implemented within the constraints?
+- What can be realistically implemented within the rules?
 
-Be balanced - acknowledge valid points while defending reasonable methodological choices that work within the system constraints. Keep analysis focused (max 500 words)."""
+Be balanced - acknowledge valid points while defending reasonable methodological choices that work within the system rules. Keep analysis focused (max 500 words)."""
                 },
                 {
                     "title": "Final_Plan",
                     "model": "gemini",
-                    "prompt": """SYSTEM CONSTRAINTS: {system_prompt}
+                    "prompt": """SYSTEM RULES: {system_prompt}
 
 Based on the original plan {step1_result}, the critique {step2_result}, and the counter-analysis {step3_result}, create a FINAL CONCISE research plan (max 1000 words).
 
 DECISIONS TO MAKE:
-- What criticisms to implement within system constraints?
+- What criticisms to implement within system rules?
 - What to reject and why?
 - Final experimental design respecting SmolLM dataset and time limits
 - Clear success criteria
 - Minimal viable implementation
 
-PRIORITIZE: Fairness, feasibility within constraints, and scientific rigor. Avoid feature bloat. Focus on what will actually advance the field while staying within the practical limitations."""
+PRIORITIZE: Fairness, feasibility within rules, and scientific rigor. Avoid feature bloat. Focus on what will actually advance the field while staying within the practical limitations."""
                 }
             ]
 
