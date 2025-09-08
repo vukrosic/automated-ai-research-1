@@ -957,7 +957,10 @@ if __name__ == "__main__":
 
     # Convert dict configs back to MoEModelConfig objects
     for exp in experiments:
-        exp['config'] = MoEModelConfig(**exp['config'])
+        # Remove d_k field that's set in __post_init__
+        config_dict = exp['config'].copy()
+        config_dict.pop('d_k', None)
+        exp['config'] = MoEModelConfig(**config_dict)
 
     # Run all experiments
     results = []
