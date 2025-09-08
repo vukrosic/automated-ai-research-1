@@ -973,12 +973,15 @@ if __name__ == "__main__":
     print("📊 EXPERIMENT SUMMARY COMPARISON")
     print("="*80)
 
-    print("<10"    print("-" * 70)
+    print(f"{'Experiment':<40} {'Test PPL':<10} {'Improvement':<12} {'Overhead':<10}")
+    print("-" * 70)
 
     for result in results:
         config = result['config']
         test_ppl = result['test_perplexity']
         ms_step = result['ms_per_step']
+        exp_name = result['experiment_name'][:39]  # Truncate long names
+        improvement = "N/A"
         overhead = "N/A"
 
         if result['experiment_name'] == 'Baseline MoE (Control)':
@@ -988,7 +991,10 @@ if __name__ == "__main__":
             improvement = ((baseline_ppl - test_ppl) / baseline_ppl) * 100
             overhead = ((ms_step - baseline_ms) / baseline_ms) * 100
 
-        print("<10")
+        if isinstance(improvement, str):
+            print(f"{exp_name:<40} {test_ppl:<10.2f} {improvement:<12} {overhead:<10}")
+        else:
+            print(f"{exp_name:<40} {test_ppl:<10.2f} {improvement:<12.1f}% {overhead:<10.1f}%")
 
     print("\n🏆 Primary Success Metric: Test Perplexity (lower is better)")
     print("⚡ Overhead: ms/step increase relative to baseline (lower is better)")
