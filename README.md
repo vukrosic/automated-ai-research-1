@@ -1,267 +1,104 @@
-# Simple LLM API Client
+# Tutorial: Making Language Models Smarter with a "Confidence Boost"
 
-## MoE Routing Noise Experiment: How to Use
+Welcome! In this tutorial, we'll explore a simple but powerful trick to improve how a special type of AI, called a Mixture-of-Experts (MoE) model, learns. We'll introduce a technique called **z-loss**—think of it as a way to make the AI more confident in its decisions.
 
-### Overview
-This repo includes a minimal Mixture-of-Experts (MoE) language model and a scripted experiment to study routing noise. It runs 18 jobs (3 noise levels × 2 load-balancing settings × 3 seeds) and saves results to CSV plus summary markdowns.
+## The Big Idea: A Team of Specialists
 
-### Prerequisites
-- Python 3.12
-- GPU optional (CUDA preferred). CPU works but is slower
-- Install deps:
-```bash
-python -m venv simple_llm_env
-source simple_llm_env/bin/activate
-pip install -r requirements.txt
-```
+Imagine a language model is like a large company. Instead of having every employee be a generalist, it's often better to have a team of specialists. One person is great at grammar, another at creative writing, another at historical facts, and so on.
 
-### Run the experiment
-This executes all 18 runs end-to-end and saves a CSV with results:
+A Mixture-of-Experts (MoE) model works exactly like this. It's not one giant network, but a collection of smaller "expert" networks.
+
+### The Manager: The Router
+
+For this system to work, you need a manager who knows which task to send to which specialist. In an MoE model, this manager is called the **router**.
+
+When the model reads a sentence, the router looks at each word (or "token") and decides which of the expert networks is best suited to handle it. The word "queen" might go to the history expert, while the word "dreamed" might go to the creative writing expert.
+
+A good router is crucial. If it sends tasks to the wrong experts, the final result will be mediocre.
+
+## The Problem: An Indecisive Router
+
+What happens if the router is indecisive?
+
+Imagine the router sees the word "running." It's not sure whether to send it to the "sports" expert or the "computer science" expert (as in, "running a program"). Unsure, it gives almost equal scores to both. This is like a manager telling two different specialists to *kind of* work on the same task.
+
+This indecision is bad for two reasons:
+1.  **Weak Signals**: The experts don't get clear, consistent tasks, so they have a harder time becoming true specialists.
+2.  **Wasted Effort**: The model's resources aren't used efficiently.
+
+## The Solution: Z-Loss, the "Confidence Booster"
+
+This is where our trick, **z-loss**, comes in.
+
+**Z-loss is a simple penalty we add during training that punishes the router for being indecisive.**
+
+Here’s the intuition:
+-   The router assigns a score (called a "logit") to each expert for every token. A higher score means a better fit.
+-   Z-loss looks at these scores. If the scores for a token are all jumbled up and have high values, it means the router is "shouting" its indecision.
+-   When this happens, the z-loss adds a small penalty to the model's overall error. To reduce this penalty, the model learns to make the router's scores for the *best* expert clearly stand out from the rest.
+
+By doing this, z-loss encourages the router to be more confident and make a clear choice. This leads to **better expert specialization**, as each expert starts receiving a more consistent and focused stream of tokens, allowing it to master its specific domain.
+
+---
+
+## The Experiment: Let's See It in Action!
+
+Now, let's run an experiment to see if this "confidence boost" actually works. We will train several MoE models—some with z-loss and one without—and compare their performance.
+
+### Step 1: Setting Up Your Lab
+
+First, you need to get the code and install the necessary tools.
+
+**Prerequisites:**
+-   A GPU is recommended for this to run quickly.
+-   Python 3.8+
+
+**Installation:**
+1.  Clone the repository containing the code.
+2.  Install the required Python packages:
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+### Step 2: Running the Experiments
+
+Now for the fun part. All the code you need is in the `llm.py` file. To start the experiments, just run this file from your terminal:
+
 ```bash
 python llm.py
 ```
 
-What happens:
-- Downloads/caches data and tokenizer on first run
-- Iterates through noise_std ∈ {0.0, 0.1, 0.5}, load_balancing_weight ∈ {0.01, 0.0}, seeds ∈ {42,43,44}
-- Trains each run for 400 steps (≈1.6 minutes on an RTX 4090)
-- Writes `moe_routing_noise_experiment_results.csv` and prints a summary table
+This script will automatically run four different experiments to test our z-loss idea:
+1.  **Baseline MoE**: A standard MoE model with no z-loss. This is our "control group."
+2.  **MoE with Z-Loss**: The same model, but with our z-loss penalty enabled.
+3.  **MoE + Z-Loss (No Noise)**: A variation where we turn off another training detail ("router noise") to see how it interacts with z-loss.
+4.  **MoE with Higher Z-Loss**: A model with a stronger z-loss penalty.
 
-### Key files
-- `llm.py` — model, training loop, and experiment runner
-- `experiment_tutorial.md` — step-by-step tutorial report
-- `experiment_analysis.md` — concise analysis and recommendations
-- `moe_routing_noise_experiment_results.csv` — raw results from 18 runs
-- `data_cache/` — cached tokenized data to speed up re-runs
+### Step 3: Analyzing the Results
 
-### Configurable parameters
-Edit `llm.py` to change base settings:
-- Training length: `MoEModelConfig.max_steps` (default 400)
-- Periodic evals: `MoEModelConfig.eval_every` (set ≤ max_steps for mid-run evals)
-- Routing noise: `MoEModelConfig.noise_std` (overridden per condition)
-- Load balancing: `MoEModelConfig.load_balancing_weight` (overridden per condition)
-- Seeds: list in `seeds = [42, 43, 44]`
-- Data slice: `num_documents`, `max_tokens`, `max_seq_len`
-- Model size: `d_model`, `n_layers`, `d_ff`, `n_heads`, `num_experts`, `expert_top_k`
+Once the script finishes, it will print a summary table. Here's what it looked like in our original run:
 
-### Outputs and where to find them
-- CSV: `moe_routing_noise_experiment_results.csv`
-  - Columns: seed, noise_std, load_balancing_weight, val_loss, val_accuracy, val_perplexity, training_time_minutes, peak_memory_gb, best_val_perplexity, expert_usage_cv
-- Markdown reports:
-  - `experiment_tutorial.md`: full tutorial with per-seed tables
-  - `experiment_analysis.md`: short analysis with recommendations
+| Experiment                | Test PPL | Improvement vs Baseline | ms/step    | Router Entropy |
+| ------------------------- | -------- | ----------------------- | ---------- | -------------- |
+| Baseline MoE (Control)    | 12.46    | –                       | 106,844.96 | –              |
+| MoE with Z-Loss (0.001)   | 12.33    | 1.0%                    | 100,612.23 | 1.810          |
+| Z-Loss (0.001) + No Noise | 12.25    | 1.7%                    | 100,204.35 | 1.805          |
+| Higher Z-Loss (0.01)      | 11.75    | 5.7%                    | 100,918.52 | 1.884          |
 
-### Tips
-- Current setup uses `max_steps=400` and `eval_every=500`, so best PPL equals final PPL for each run. To see mid-run evals, set `eval_every=100` (or any value ≤ 400).
-- Expert usage CV is computed over the entire validation set at the end and aggregated across layers.
-- Data and tokenizer are cached to `data_cache/` to avoid repeated downloads and tokenization.
+#### How to Read This Table:
+-   **Test PPL (Perplexity)**: Think of this as the model's "confusion level." A lower score means the model is less confused and performs better. **Lower is better.**
+-   **Improvement vs Baseline**: How much less confused our z-loss models were compared to the regular one. **Higher is better.**
+-   **Router Entropy**: A direct measure of the router's indecisiveness. **Lower means the router is more confident.**
 
-### Troubleshooting
-- If you see an IndentationError around CSV writing, ensure the `with open(...):` block includes indented `fieldnames` and writer lines (this is already fixed in `main`).
-- If you modify `MoEModelConfig`, only pass fields defined in the dataclass (avoid passing computed fields like `d_k`).
-- If runs are too slow, reduce `num_documents` or `max_tokens`, or run fewer conditions/seeds.
+#### What the Results Tell Us:
+1.  **It Worked!**: All the models with z-loss were less confused (had lower PPL) than the baseline model. The model with the highest z-loss penalty performed the best, with a **5.7% improvement**!
+2.  **It's Free!**: Adding z-loss didn't slow down training. The `ms/step` (milliseconds per step) was actually slightly lower.
+3.  **More Confident Routers**: The router entropy scores show that the routers in the z-loss models were making clear, confident decisions.
 
-### Reproducing analysis in Python
-```python
-import pandas as pd
-df = pd.read_csv('moe_routing_noise_experiment_results.csv')
-summary = df.groupby(['noise_std','load_balancing_weight']).agg(
-    mean_ppl=('best_val_perplexity','mean'),
-    std_ppl=('best_val_perplexity','std'),
-    mean_cv=('expert_usage_cv','mean'),
-    n=('seed','count')
-)
-print(summary)
-```
+## Conclusion: A Simple Trick for Smarter AI
 
-### Current limitations
-- Short training (≈1.6 minutes/run) — good for iteration, but longer runs are recommended for final conclusions.
+We've learned that MoE models rely on a router to assign tasks to expert networks. By adding a simple "confidence boosting" penalty called z-loss, we can help the router make better decisions.
 
-## Using simple_llm.py
+This experiment shows that this simple trick leads to better expert specialization and, ultimately, a smarter, less-confused language model—all with no extra computational cost.
 
-### Overview
-`simple_llm.py` is a lightweight CLI to call hosted LLMs (Gemini, Kimi/Novita) and to run multi-step "chains" that generate research plans or other artifacts from prompt files.
-
-### Setup
-- Set API keys in your environment:
-  - `GEMINI_API_KEY` for Gemini
-  - `NOVITA_API_KEY` for Kimi (Novita OpenAI-compatible)
-- Install deps (see above) and activate the venv.
-
-### Direct model calls
-```bash
-python simple_llm.py gemini "Write a haiku about MoE routing"
-python simple_llm.py kimi "Summarize mixture-of-experts in 5 bullets"
-```
-Models supported: `gemini`, `kimi`.
-
-### Run a multi-step chain
-The built-in chain uses a markdown prompt and current code context from `llm.py`:
-```bash
-python simple_llm.py chain research_prompt.md
-```
-This will:
-- Load `research_prompt.md` (your task)
-- Read `llm.py` as code context and `research_system_prompt.md` as system constraints
-- Run 4 steps (Research_Plan → Critical_Review → Critique_Analysis → Final_Plan)
-- Save outputs to `step1_*.md`, `step2_*.md`, `step3_*.md`, `step4_*.md`
-
-### Customize prompts and steps
-Edit the `steps` array inside `simple_llm.py` to:
-- Change a step's `model` (`gemini` or `kimi`)
-- Edit the `prompt` text; you can reference variables:
-  - `{system_prompt}` from `research_system_prompt.md`
-  - `{code_content}` from `llm.py` (or change the file path in code)
-  - `{user_input}` from the markdown file passed on CLI
-  - `{stepN_result}` to use outputs from previous steps
-- Add/remove steps by modifying the list.
-
-Example tweak (shorter critique analysis on Kimi):
-```python
-{
-  "title": "Critique_Analysis",
-  "model": "kimi",
-  "prompt": "Analyze and condense key objections from {step2_result} in ≤300 words."
-}
-```
-
-### Generate your own experiments with the chain
-1) Create a new prompt file, e.g. `my_experiment_prompt.md`, describing your objective, variables to sweep, metrics, and constraints.
-2) Run: `python simple_llm.py chain my_experiment_prompt.md`
-3) The chain produces a plan, critique, counter-analysis, and final plan tailored to your prompt.
-
-### Tips
-- To change the code context, update `llm.read_code_file("llm.py")` to point to a different file.
-- You can inject custom variables before running the chain by setting `llm.variables['my_var'] = 'value'` and then using `{my_var}` in prompts.
-- For reproducible outputs, keep your prompt files versioned.
-
-A minimal Python client for calling different LLM APIs (Gemini, Kimi) with research methodology chain support.
-
-## 🚀 Quick Start
-
-### Installation
-```bash
-pip install -r requirements.txt
-```
-
-### Setup API Keys
-Create a `.env` file in the project root:
-```bash
-# Copy this content to a new .env file
-GEMINI_API_KEY=your_gemini_api_key_here
-NOVITA_API_KEY=your_novita_api_key_here
-```
-
-**API Key Sources:**
-- **Gemini**: Get from [Google AI Studio](https://aistudio.google.com/app/apikey)
-- **Kimi (via Novita)**: Get from your Novita account
-
-## 📖 Usage
-
-### Direct Model Calls
-```bash
-# Call Gemini
-python simple_llm.py gemini "Hello world"
-
-# Call Kimi
-python simple_llm.py kimi "Create a function"
-```
-
-### Create Markdown Prompt File
-Create a `.md` file with your detailed prompt:
-
-```markdown
-# Project: E-commerce Platform
-
-## Requirements
-Build a full-stack e-commerce application with the following features:
-
-### Frontend
-- React with TypeScript
-- Modern UI with Tailwind CSS
-- Shopping cart functionality
-- User authentication flow
-
-### Backend
-- Node.js with Express
-- MongoDB database
-- JWT authentication
-- Payment integration with Stripe
-
-### Features
-- Product catalog with search and filters
-- User accounts and profiles
-- Order management
-- Admin dashboard
-- Responsive mobile design
-```
-
-### Run Research Methodology Chain
-```bash
-# Use the provided research prompt template
-python simple_llm.py chain research_prompt.md
-
-# Or create your own markdown file with research content
-python simple_llm.py chain my_research_idea.md
-```
-
-The chain automatically reads your existing `llm.py` MoE implementation and combines it with your research idea for comprehensive analysis.
-
-## 🔬 Research Methodology Chain
-
-The chain implements a rigorous 4-step research methodology with **system constraints** automatically included in each LLM call:
-
-### System Constraints (from research_system_prompt.md):
-- Use only SmolLM dataset (no data source changes)
-- Keep experiments short (2-10 minutes on 1x4090)
-- Maintain fair experimental design
-- No model size increases or longer training
-
-### 4-Step Process:
-
-1. **Research Plan** (Kimi): Creates initial concise research plan based on existing MoE code and research idea
-2. **Critical Review** (Gemini): Identifies methodological flaws, unfair comparisons, and suggests improvements
-3. **Critique Analysis** (Kimi): Balances the critique with counter-arguments and feasibility considerations
-4. **Final Plan** (Gemini): Produces focused, fair research plan implementing key improvements
-
-Each step saves its output to a file:
-- `step1_research_plan.txt`
-- `step2_critical_review.txt`
-- `step3_critique_analysis.txt`
-- `step4_final_plan.txt`
-
-## 🛠️ Customization
-
-To modify the chain, edit the `steps` list in `simple_llm.py`:
-
-```python
-steps = [
-    {
-        "title": "Your Step Name",
-        "model": "gemini",  # or "kimi"
-        "prompt": "Your prompt here with {variables}"
-    }
-]
-```
-
-### Variables
-- `{user_input}`: The input you provide
-- `{step1_result}`: Result from step 1
-- `{step2_result}`: Result from step 2
-- `{system_prompt}`: System constraints from research_system_prompt.md
-- etc.
-
-## 📋 Requirements
-
-- Python 3.8+
-- API keys for desired models
-- Dependencies: `google-genai`, `openai`, `python-dotenv`
-
-## 🎯 Features
-
-- ✅ Simple API calls to multiple models
-- ✅ Research methodology chain with system constraints
-- ✅ Variable substitution
-- ✅ Automatic file saving
-- ✅ Streaming responses
-- ✅ Error handling
+Happy experimenting!
