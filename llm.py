@@ -36,7 +36,7 @@ class MoEModelConfig:
     n_layers: int = 6
     d_ff: int = 1536
     batch_size: int = 24
-    max_steps: int = 400
+    max_steps: int = 3000
 
     # Training parameters
     gradient_accumulation_steps: int = 4
@@ -65,7 +65,6 @@ class MoEModelConfig:
     num_experts: int = 8
     expert_top_k: int = 2
     load_balancing_weight: float = 0.01
-    noise_std: float = 0.1
 
     def __post_init__(self):
         self.d_k = self.d_model // self.n_heads
@@ -248,12 +247,12 @@ class Expert(nn.Module):
 
 class TopKRouter(nn.Module):
     """Router that selects top-k experts for each token"""
-    def __init__(self, d_model: int, num_experts: int, top_k: int = 2, noise_std: float = 0.1):
+    def __init__(self, d_model: int, num_experts: int, top_k: int = 2):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
         self.gate = nn.Linear(d_model, num_experts, bias=False)
-        self.noise_std = noise_std  # Standard deviation for noise during training
+        self.noise_std = 0.1  # Standard deviation for noise during training
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -293,8 +292,7 @@ class MixtureOfExperts(nn.Module):
         num_experts: int = 8,
         top_k: int = 2,
         dropout: float = 0.1,
-        load_balancing_weight: float = 0.01,
-        noise_std: float = 0.1
+        load_balancing_weight: float = 0.01
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -307,7 +305,7 @@ class MixtureOfExperts(nn.Module):
         ])
 
         # Create router
-        self.router = TopKRouter(d_model, num_experts, top_k, noise_std)
+        self.router = TopKRouter(d_model, num_experts, top_k)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -389,9 +387,7 @@ class MoETransformerBlock(nn.Module):
         max_seq_len: int,
         num_experts: int = 8,
         top_k: int = 2,
-        dropout: float = 0.1,
-        load_balancing_weight: float = 0.01,
-        noise_std: float = 0.1
+        dropout: float = 0.1
     ):
         super().__init__()
 
@@ -400,7 +396,7 @@ class MoETransformerBlock(nn.Module):
 
         # MoE layer
         self.feed_forward = MixtureOfExperts(
-            d_model, d_ff, num_experts, top_k, dropout, load_balancing_weight, noise_std
+            d_model, d_ff, num_experts, top_k, dropout
         )
 
         # Normalization layers
@@ -438,9 +434,7 @@ class MoEMinimalLLM(nn.Module):
                 config.max_seq_len,
                 config.num_experts,
                 config.expert_top_k,
-                config.dropout,
-                config.load_balancing_weight,
-                config.noise_std
+                config.dropout
             )
             for i in range(config.n_layers)
         ])
@@ -489,53 +483,7 @@ class MoEMinimalLLM(nn.Module):
             return logits, total_aux_loss
         return logits
 
-def compute_expert_usage_cv(model: nn.Module, val_loader: DataLoader, config: MoEModelConfig):
-    """Compute Coefficient of Variation of expert usage across entire validation set"""
-    model.eval()
-    device = next(model.parameters()).device
-
-    expert_usage_counts = torch.zeros(config.num_experts, device=device)
-
-    with torch.no_grad():
-        for x, y in val_loader:
-            x, y = x.to(device), y.to(device)
-
-            # Forward pass to get routing decisions
-            with autocast(enabled=config.use_amp):
-                # We need to manually route through the MoE layers to collect statistics
-                x_embed = model.token_embedding(x) * math.sqrt(config.d_model)
-                x_embed = model.position_dropout(x_embed)
-
-                # Pass through transformer blocks and collect routing info
-                for block in model.transformer_blocks:
-                    # Get routing decisions from the MoE layer
-                    batch_size, seq_len, d_model = x_embed.shape
-                    router_weights, expert_indices, _ = block.feed_forward.router(x_embed)
-
-                    # Count expert usage (each token contributes to top-k experts)
-                    for expert_idx in range(config.num_experts):
-                        expert_mask = (expert_indices == expert_idx).any(dim=-1)  # [batch_size, seq_len]
-                        expert_usage_counts[expert_idx] += expert_mask.sum()
-
-                    # Continue with normal forward pass
-                    x_embed, _ = block(x_embed)
-
-    # Move to CPU for numpy operations
-    expert_usage_counts = expert_usage_counts.cpu().numpy()
-
-    # Compute Coefficient of Variation
-    mean_usage = np.mean(expert_usage_counts)
-    std_usage = np.std(expert_usage_counts)
-
-    if mean_usage > 0:
-        cv = std_usage / mean_usage
-    else:
-        cv = 0.0
-
-    model.train()
-    return cv
-
-def evaluate_model(model: nn.Module, val_loader: DataLoader, config: MoEModelConfig, compute_expert_cv: bool = False):
+def evaluate_model(model: nn.Module, val_loader: DataLoader, config: MoEModelConfig):
     """Evaluate model performance"""
     model.eval()
     total_loss = 0
@@ -565,18 +513,8 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: MoEModelCon
     accuracy = total_correct / total_tokens
     perplexity = math.exp(min(avg_loss, 20))
 
-    # Compute expert usage CV if requested
-    expert_cv = None
-    if compute_expert_cv:
-        expert_cv = compute_expert_usage_cv(model, val_loader, config)
-
     model.train()
-
-    result = {'val_loss': avg_loss, 'val_accuracy': accuracy, 'val_perplexity': perplexity}
-    if expert_cv is not None:
-        result['expert_usage_cv'] = expert_cv
-
-    return result
+    return {'val_loss': avg_loss, 'val_accuracy': accuracy, 'val_perplexity': perplexity}
 
 def setup_muon_optimizer(model: nn.Module, config: MoEModelConfig):
     """Setup Muon optimizer with hybrid approach"""
@@ -606,12 +544,10 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
     print(f"\n🚀 Training MoE model with {config.num_experts} experts (top-{config.expert_top_k})")
 
     # Initialize model
+    set_seed(42)
     model = MoEMinimalLLM(config)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
-
-    # Track best validation perplexity
-    best_val_perplexity = float('inf')
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -722,18 +658,10 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
                       f"Val Acc: {eval_metrics['val_accuracy']:.4f}, "
                       f"Val PPL: {eval_metrics['val_perplexity']:.2f}")
 
-                # Track best validation perplexity
-                if eval_metrics['val_perplexity'] < best_val_perplexity:
-                    best_val_perplexity = eval_metrics['val_perplexity']
-
             # Milestone evaluations
-            if step in getattr(config, 'log_milestones', ()):
+            if step in getattr(config, 'log_milestones', ()):    
                 eval_metrics = evaluate_model(model, val_loader, config)
                 print(f"\n🧪 Milestone {step}: Val Loss: {eval_metrics['val_loss']:.4f}")
-
-                # Track best validation perplexity
-                if eval_metrics['val_perplexity'] < best_val_perplexity:
-                    best_val_perplexity = eval_metrics['val_perplexity']
 
             step += 1
             if step % 100 == 0:
@@ -741,76 +669,14 @@ def train_moe_model(config: MoEModelConfig, train_loader: DataLoader, val_loader
 
     pbar.close()
 
-    # Final evaluation (compute expert CV for final evaluation)
-    final_eval = evaluate_model(model, val_loader, config, compute_expert_cv=True)
-
-    # Update best perplexity with final evaluation if better
-    if final_eval['val_perplexity'] < best_val_perplexity:
-        best_val_perplexity = final_eval['val_perplexity']
-
-    # Add best perplexity to final metrics
-    final_eval['best_val_perplexity'] = best_val_perplexity
-
+    # Final evaluation
+    final_eval = evaluate_model(model, val_loader, config)
     print(f"\n📊 Final Results:")
     print(f"   Val Loss: {final_eval['val_loss']:.4f}")
     print(f"   Val Accuracy: {final_eval['val_accuracy']:.4f}")
     print(f"   Val Perplexity: {final_eval['val_perplexity']:.2f}")
-    print(f"   Best Val Perplexity: {best_val_perplexity:.2f}")
-    if 'expert_usage_cv' in final_eval:
-        print(f"   Expert Usage CV: {final_eval['expert_usage_cv']:.4f}")
 
     return model, final_eval
-
-def run_single_experiment(config: MoEModelConfig, seed: int, train_loader: DataLoader, val_loader: DataLoader):
-    """Run a single MoE training experiment"""
-    print(f"\n🔬 Running experiment with seed={seed}, noise_std={config.noise_std}, load_balancing_weight={config.load_balancing_weight}")
-
-    # Set seed for reproducibility
-    set_seed(seed)
-
-    # Reset data loaders with new seed for consistent splits
-    temp_config = MoEModelConfig()
-    texts, tokenizer, tokens = load_and_cache_data(temp_config)
-    dataset = TextTokenDataset(tokens, temp_config.max_seq_len)
-
-    val_size = len(dataset) // 10
-    train_size = len(dataset) - val_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size], generator=torch.Generator().manual_seed(seed)
-    )
-
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=2)
-
-    # Track memory usage
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-
-    start_time = time.time()
-    model, final_metrics = train_moe_model(config, train_loader, val_loader)
-    total_time = time.time() - start_time
-
-    # Get memory usage
-    if torch.cuda.is_available():
-        peak_memory = torch.cuda.max_memory_allocated() / 1e9  # GB
-    else:
-        peak_memory = 0.0
-
-    results = {
-        'seed': seed,
-        'noise_std': config.noise_std,
-        'load_balancing_weight': config.load_balancing_weight,
-        'val_loss': final_metrics['val_loss'],
-        'val_accuracy': final_metrics['val_accuracy'],
-        'val_perplexity': final_metrics['val_perplexity'],
-        'training_time_minutes': total_time / 60,
-        'peak_memory_gb': peak_memory,
-        'best_val_perplexity': final_metrics.get('best_val_perplexity', final_metrics['val_perplexity']),
-        'expert_usage_cv': final_metrics.get('expert_usage_cv', None)
-    }
-
-    print(f"✅ Experiment completed in {total_time/60:.1f} minutes")
-    return results
 
 if __name__ == "__main__":
     # Check system
@@ -819,98 +685,66 @@ if __name__ == "__main__":
         print(f"GPU: {torch.cuda.get_device_name()}")
         print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
+    # Set seed
+    set_seed(42)
+
     # Load data first to get vocab_size
-    temp_config = MoEModelConfig()
+    temp_config = MoEModelConfig()  # Use MoE config for data loading
     texts, tokenizer, tokens = load_and_cache_data(temp_config)
     vocab_size = temp_config.vocab_size
 
-    # Experimental conditions
-    noise_levels = [0.0, 0.1, 0.5]
-    load_balancing_weights = [0.01, 0.0]
-    seeds = [42, 43, 44]
-
-    print(f"\n🧪 EXPERIMENTAL DESIGN: Routing Noise in Small-Scale MoEs")
-    print(f"{'='*70}")
-    print(f"Conditions: {len(noise_levels)} noise levels × {len(load_balancing_weights)} weight levels × {len(seeds)} seeds = {len(noise_levels) * len(load_balancing_weights) * len(seeds)} total runs")
-
-    # Base configuration
-    base_config = MoEModelConfig(
+    # Test MoE model
+    config = MoEModelConfig(
         # Base model parameters
         d_model=384,
         n_heads=8,
         n_layers=6,
         d_ff=1536,
         batch_size=24,
-        max_steps=400,
-        eval_every=500,  # Every 500 steps as per research plan
+        max_steps=1000,
+        eval_every=10000000,
         vocab_size=vocab_size,
 
-        # MoE specific (will be overridden per experiment)
+        # MoE specific
         num_experts=8,
         expert_top_k=2,
-        load_balancing_weight=0.01,  # Will be overridden
-        noise_std=0.1  # Will be overridden
+        load_balancing_weight=0.01
     )
 
-    # Store all results
-    all_results = []
+    dataset = TextTokenDataset(tokens, temp_config.max_seq_len)
 
-    # Run experiments
-    for noise_std in noise_levels:
-        for lb_weight in load_balancing_weights:
-            for seed in seeds:
-                # Create config for this experiment
-                # Only copy the actual initialization parameters, not computed properties
-                init_params = [
-                    'd_model', 'n_heads', 'n_layers', 'd_ff', 'batch_size', 'max_steps',
-                    'gradient_accumulation_steps', 'muon_lr', 'max_seq_len', 'num_documents',
-                    'max_tokens', 'eval_every', 'eval_steps', 'weight_decay', 'dropout',
-                    'grad_clip', 'use_amp', 'vocab_size', 'log_milestones', 'num_experts',
-                    'expert_top_k', 'load_balancing_weight', 'noise_std'
-                ]
-                config_dict = {param: getattr(base_config, param) for param in init_params}
-                config_dict['noise_std'] = noise_std
-                config_dict['load_balancing_weight'] = lb_weight
-                config = MoEModelConfig(**config_dict)
+    # Train/val split
+    val_size = len(dataset) // 10
+    train_size = len(dataset) - val_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
+    )
 
-                # Run experiment
-                result = run_single_experiment(config, seed, None, None)  # Data loaders created inside
-                all_results.append(result)
+    train_loader = DataLoader(train_dataset, batch_size=temp_config.batch_size, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=temp_config.batch_size, shuffle=False, num_workers=2)
 
-    # Save results to CSV
-    import csv
-    results_file = "moe_routing_noise_experiment_results.csv"
-    with open(results_file, 'w', newline='') as csvfile:
-        fieldnames = ['seed', 'noise_std', 'load_balancing_weight', 'val_loss', 'val_accuracy',
-                     'val_perplexity', 'training_time_minutes', 'peak_memory_gb', 'best_val_perplexity', 'expert_usage_cv']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(all_results)
+    print(f"📊 Dataset: {len(train_dataset)} train, {len(val_dataset)} val samples")
 
-    print(f"\n💾 Results saved to {results_file}")
+    # Train MoE model
+    print(f"\n{'='*60}")
+    print(f"🧪 TRAINING: Mixture of Experts Model")
+    print(f"{'='*60}")
 
-    # Summary statistics
-    print(f"\n📊 EXPERIMENT SUMMARY")
-    print(f"{'='*70}")
+    print(f"\n📋 MoE Model Configuration:")
+    print(f"   Architecture: {config.d_model}d, {config.n_layers}L, {config.n_heads}H, {config.d_ff}ff")
+    print(f"   MoE: {config.num_experts} experts, top-{config.expert_top_k} routing")
+    print(f"   Training: {config.max_steps} steps, batch size {config.batch_size}")
+    print(f"   Data: {config.max_tokens:,} tokens, seq_len {config.max_seq_len}")
 
-    for noise_std in noise_levels:
-        for lb_weight in load_balancing_weights:
-            condition_results = [r for r in all_results if r['noise_std'] == noise_std and r['load_balancing_weight'] == lb_weight]
+    # Train model
+    start_time = time.time()
+    model, final_metrics = train_moe_model(config, train_loader, val_loader)
+    total_time = time.time() - start_time
 
-            if condition_results:
-                mean_ppl = sum(r['best_val_perplexity'] for r in condition_results) / len(condition_results)
-                std_ppl = (sum((r['best_val_perplexity'] - mean_ppl)**2 for r in condition_results) / len(condition_results))**0.5
-                mean_time = sum(r['training_time_minutes'] for r in condition_results) / len(condition_results)
-
-                # Compute mean expert CV if available
-                expert_cvs = [r['expert_usage_cv'] for r in condition_results if r['expert_usage_cv'] is not None]
-                mean_cv = sum(expert_cvs) / len(expert_cvs) if expert_cvs else None
-
-                print(f"Noise: {noise_std}, LB Weight: {lb_weight}")
-                print(f"  Best Val PPL: {mean_ppl:.2f} ± {std_ppl:.2f}")
-                print(f"  Avg Time: {mean_time:.1f} minutes")
-                if mean_cv is not None:
-                    print(f"  Expert Usage CV: {mean_cv:.4f}")
-                print()
-
-    print(f"✅ All {len(all_results)} experiments completed!")
+    print(f"\n🎯 MoE Model Results:")
+    print(f"⏱️ Training time: {total_time/60:.1f} minutes")
+    print(f"🏆 Final Results:")
+    print(f"   Validation Loss: {final_metrics['val_loss']:.4f}")
+    print(f"   Validation Accuracy: {final_metrics['val_accuracy']:.4f}")
+    print(f"   Validation Perplexity: {final_metrics['val_perplexity']:.2f}")
+    print(f"{'='*60}")

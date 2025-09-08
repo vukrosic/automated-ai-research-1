@@ -46,7 +46,7 @@ same computational capacity as illustrated in Figure 3a
 - Create rigorous experimental design
 - Keep research scope manageable and focused
 
-   - Create initial research plan
-   - Critically review for methodological issues
-   - Analyze the critique
-   - Produce final focused research plan
+- Create initial research plan
+- Critically review for methodological issues
+- Analyze the critique
+- Produce final focused research plan
